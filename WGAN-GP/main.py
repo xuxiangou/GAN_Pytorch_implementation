@@ -13,11 +13,11 @@ from Regularization import calculate_gradient
 def creat_opt(known=False):
     parser = ArgumentParser()
     parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
-    parser.add_argument("--batch_size", type=int, default=9, help="size of the batches")
-    parser.add_argument("--lr", type=float, default=0.0001, help="adam: learning rate")
-    parser.add_argument("--b1", type=float, default=0, help="adam: decay of first order momentum of gradient")
+    parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
+    parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
+    parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
     parser.add_argument("--b2", type=float, default=0.9, help="adam: decay of first order momentum of gradient")
-    parser.add_argument("--num_cpu", type=int, default=4, help="number of cpu threads to use during batch generation")
+    parser.add_argument("--num_cpu", type=int, default=2, help="number of cpu threads to use during batch generation")
     parser.add_argument("--latent_dim", type=int, default=100, help="dimensionality of the latent space")
     parser.add_argument("--img_size", type=int, default=32, help="size of each image dimension")
     parser.add_argument("--data", type=str, default="../imageset",
@@ -26,7 +26,7 @@ def creat_opt(known=False):
     parser.add_argument("--channels", type=int, default=3, help="the channels of image")
     parser.add_argument("--device", default=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                         help="the device to train")
-    parser.add_argument("--LAMBDA", type=int, default=10, help="the regular term of penalty")
+    parser.add_argument("--penalty_lambda", type=int, default=10, help="the regular term of penalty")
     parser.add_argument("--n_critics", type=int, default=5)
     parser.add_argument("--weight_disc", type=str, default="./weight/Discriminator_SN_WGAN_GP.pt",
                         help="the weight of discriminator")
@@ -43,7 +43,7 @@ def main(load_model=False):
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
-            # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ]
     )
 
@@ -61,14 +61,14 @@ def main(load_model=False):
 
     optim_D = torch.optim.Adam(D.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
     optim_G = torch.optim.Adam(G.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+    schedule_D = torch.optim.lr_scheduler.StepLR(optim_D, gamma=0.92, step_size=8, verbose=True)
+    schedule_G = torch.optim.lr_scheduler.StepLR(optim_G, gamma=0.92, step_size=8, verbose=True)
 
     for i in range(opt.n_epochs):
         print("")
         print(f"epoch: {i + 1}")
         loop = tqdm(TrainData)
 
-        D_loss = 0.
-        G_loss = 0.
         discriminator_loss = 0.
         generator_loss = 0.
         for batch_index, (real_data, _) in enumerate(loop):
@@ -79,7 +79,7 @@ def main(load_model=False):
             # --------------------
             real_data = real_data.to(opt.device)
 
-            noise = generate_noise((opt.batch_size, opt.latent_dim)).to(opt.device)
+            noise = generate_noise((opt.batch_size, opt.latent_dim), device=opt.device)
             fake_data = G.forward(noise)
 
             # fake image
@@ -88,19 +88,17 @@ def main(load_model=False):
             D_real = D.forward(real_data)
 
             gradient_penalty = calculate_gradient(D, real_data, fake_data, opt.batch_size, opt.channels, opt.img_size,
-                                                  opt.device, opt.LAMBDA)
+                                                  opt.device, opt.penalty_lambda)
 
             D_loss = -torch.mean(D_real) + torch.mean(D_fake) + gradient_penalty
             D_loss.backward()
             optim_D.step()
 
-            optim_G.zero_grad()
-            D_loss = to_cpu(D_loss)
-
             if batch_index % opt.n_critics == 0:
                 # ----------------
                 # train generator
                 # ----------------
+                optim_G.zero_grad()
                 fake_image = G.forward(noise)
 
                 # loss of generator
@@ -109,20 +107,21 @@ def main(load_model=False):
 
                 G_loss.backward()
                 optim_G.step()
+                generator_loss += G_loss.item()
 
-                # 将损失放置到cpu上，保存到generator中
-                G_loss = to_cpu(G_loss)
-
-            discriminator_loss += D_loss
-            generator_loss += G_loss
+            discriminator_loss += D_loss.item()
             loop.set_postfix(discriminator_loss=discriminator_loss / (batch_index + 1 + 1e-8),
-                             generator_loss=generator_loss / (batch_index + 1 + 1e-8))
+                             generator_loss=generator_loss / ((batch_index + 1) // opt.n_critics + 1))
 
         # 将损失放置到cpu上，保存到discriminator中
-        D.collect_loss(D_loss)
+        D.collect_loss(discriminator_loss * opt.batch_size / 50000)
         # 将损失放置到cpu上，保存到generator中
-        G.collect_loss(G_loss)
+        G.collect_loss(generator_loss * opt.batch_size * opt.n_critics / 50000)
         save_images(G, i, opt.latent_dim, opt.device, opt.batch_size)
+
+        # 调整学习率
+        schedule_D.step()
+        schedule_G.step()
 
     D.plot_loss()
     G.plot_loss()
